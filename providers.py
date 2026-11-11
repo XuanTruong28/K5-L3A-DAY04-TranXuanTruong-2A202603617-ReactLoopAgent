@@ -1,6 +1,8 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -11,17 +13,43 @@ CONFIG = {
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
 }
 
+_RATE_LOCK = threading.Lock()
+_LAST_CALL_TIME = 0.0
+
+
+def _retry_seconds(exc, default=65):
+    raw = exc.headers.get('Retry-After', '') if exc.headers else ''
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        return float(default)
+
 
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    global _LAST_CALL_TIME
+    is_custom = bool(os.getenv('OPENAI_BASE_URL'))
+    max_retries = 3 if is_custom else 1
+
+    for attempt in range(max_retries):
+        if is_custom:
+            with _RATE_LOCK:
+                wait = 4.3 - (time.monotonic() - _LAST_CALL_TIME)
+                if wait > 0:
+                    time.sleep(wait)
+                _LAST_CALL_TIME = time.monotonic()
+
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=100) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and is_custom and attempt + 1 < max_retries:
+                time.sleep(_retry_seconds(exc))
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
@@ -37,6 +65,8 @@ class Provider:
             raise ValueError('Cần đặt MODEL là model có hỗ trợ tool calling.')
         self.name, self.model = name, model
         key_name, self.url = CONFIG[name]
+        if name == 'openai' and os.getenv('OPENAI_BASE_URL'):
+            self.url = f"{os.getenv('OPENAI_BASE_URL').rstrip('/')}/chat/completions"
         self.key = os.getenv(key_name)
         if not self.key:
             raise ValueError(f'Thiếu {key_name}; xem README.md.')
@@ -45,6 +75,8 @@ class Provider:
         if self.name == 'anthropic':
             return self._anthropic(messages, schemas)
         payload = {'model': self.model, 'messages': messages}
+        if self.name == 'openai' and os.getenv('OPENAI_BASE_URL'):
+            payload['stream'] = False
         if schemas:
             payload['tools'] = schemas
         data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
